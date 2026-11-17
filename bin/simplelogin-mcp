@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Fetch the SimpleLogin API key from 1Password, then launch the MCP server.
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ITEM_ID="${SIMPLELOGIN_OP_ITEM:-}"
+VAULT="${SIMPLELOGIN_OP_VAULT:-Hermes Agent}"
+
+if [[ -z "${SIMPLELOGIN_API_KEY:-}" ]]; then
+  # Non-interactive Hermes processes need the service-account token from .env.
+  if [[ -f "$HOME/.hermes/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$HOME/.hermes/.env"
+    set +a
+  fi
+
+  ITEM_ID="${SIMPLELOGIN_OP_ITEM:-$ITEM_ID}"
+  VAULT="${SIMPLELOGIN_OP_VAULT:-$VAULT}"
+  if [[ -z "$ITEM_ID" ]]; then
+    echo "simplelogin-mcp: set SIMPLELOGIN_OP_ITEM to the 1Password item holding the API key" >&2
+    exit 1
+  fi
+
+  for field in password credential "api key" "API Key" token; do
+    value="$(op item get "$ITEM_ID" --vault "$VAULT" --fields "$field" --reveal 2>/dev/null || true)"
+    if [[ -n "$value" ]]; then
+      export SIMPLELOGIN_API_KEY="$value"
+      break
+    fi
+  done
+  if [[ -z "${SIMPLELOGIN_API_KEY:-}" ]]; then
+    # Fall back to a JSON read if the field has an unexpected label.
+    value="$(
+      op item get "$ITEM_ID" --vault "$VAULT" --format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    item = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for field in item.get("fields", []):
+    label = str(field.get("label", "")).lower()
+    kind = str(field.get("fieldType", "")).lower()
+    value = field.get("value")
+    if value and (any(word in label for word in ("password", "key", "token", "credential"))
+                  or kind in ("password", "concealed")):
+        print(value)
+        break
+' 2>/dev/null || true
+    )"
+    if [[ -n "$value" ]]; then
+      export SIMPLELOGIN_API_KEY="$value"
+    fi
+  fi
+  unset value
+fi
+
+if [[ -z "${SIMPLELOGIN_API_KEY:-}" ]]; then
+  echo "simplelogin-mcp: no API key (set SIMPLELOGIN_API_KEY or store it in 1Password)" >&2
+  exit 1
+fi
+
+if [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+  exec "$PROJECT_DIR/.venv/bin/python" -m simplelogin_mcp.server
+fi
+exec python3 -m simplelogin_mcp.server
